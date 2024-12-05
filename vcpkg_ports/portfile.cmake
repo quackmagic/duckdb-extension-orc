@@ -1,3 +1,5 @@
+set(CMAKE_GENERATOR "Unix Makefiles")
+
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
 vcpkg_from_github(
