@@ -34,6 +34,8 @@ if(VCPKG_TARGET_IS_UWP)
     set(configure_opts WINDOWS_USE_MSBUILD)
 endif()
 
+set(CMAKE_GENERATOR "Unix Makefiles")
+
 vcpkg_cmake_configure(
   SOURCE_PATH "${SOURCE_PATH}"
   ${configure_opts}
