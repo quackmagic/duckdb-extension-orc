@@ -14,33 +14,18 @@
 
 namespace duckdb {
 
-template<typename T>
-using enable_if_t = typename std::enable_if<T::value>::type;
-
-template<typename T>
-constexpr bool is_floating_point_v = std::is_floating_point<T>::value;
-
 struct ORCType {
     ORCType() : duckdb_type(LogicalType::INVALID) {}
     
-    ORCType(orc::TypeKind orc_type_p, LogicalType duckdb_type_p,
-            child_list_t<LogicalType> children_p = {})
-        : duckdb_type(std::move(duckdb_type_p)), 
-          orc_type(orc_type_p) {
-        // Convert child types
-        for (const auto& child : children_p) {
-            children.emplace_back(child.first, child.second);
-        }
-    }
+    ORCType(orc::TypeKind orc_type_p, LogicalType duckdb_type_p) 
+        : duckdb_type(std::move(duckdb_type_p)), orc_type(orc_type_p) {}
 
     LogicalType duckdb_type;
     orc::TypeKind orc_type;
-    child_list_t<LogicalType> children;
+    vector<pair<string, unique_ptr<ORCType>>> children;
 
-    bool operator==(const ORCType &other) const {
-        return duckdb_type == other.duckdb_type && 
-               orc_type == other.orc_type &&
-               children == other.children;
+    void AddChild(const string& name, unique_ptr<ORCType> child) {
+        children.emplace_back(name, std::move(child));
     }
 };
 
@@ -103,56 +88,61 @@ struct ORCOptions {
     MultiFileReaderOptions file_options;
 };
 
-static ORCType TransformSchema(const orc::Type* type) {
+static unique_ptr<ORCType> TransformSchema(const orc::Type* type) {
     switch (type->getKind()) {
     case orc::TypeKind::BOOLEAN:
-        return ORCType(orc::TypeKind::BOOLEAN, LogicalType::BOOLEAN);
+        return make_unique<ORCType>(orc::TypeKind::BOOLEAN, LogicalType::BOOLEAN);
     case orc::TypeKind::BYTE:
-        return ORCType(orc::TypeKind::BYTE, LogicalType::TINYINT);
+        return make_unique<ORCType>(orc::TypeKind::BYTE, LogicalType::TINYINT);
     case orc::TypeKind::SHORT:
-        return ORCType(orc::TypeKind::SHORT, LogicalType::SMALLINT);
+        return make_unique<ORCType>(orc::TypeKind::SHORT, LogicalType::SMALLINT);
     case orc::TypeKind::INT:
-        return ORCType(orc::TypeKind::INT, LogicalType::INTEGER);
+        return make_unique<ORCType>(orc::TypeKind::INT, LogicalType::INTEGER);
     case orc::TypeKind::LONG:
-        return ORCType(orc::TypeKind::LONG, LogicalType::BIGINT);
+        return make_unique<ORCType>(orc::TypeKind::LONG, LogicalType::BIGINT);
     case orc::TypeKind::FLOAT:
-        return ORCType(orc::TypeKind::FLOAT, LogicalType::FLOAT);
+        return make_unique<ORCType>(orc::TypeKind::FLOAT, LogicalType::FLOAT);
     case orc::TypeKind::DOUBLE:
-        return ORCType(orc::TypeKind::DOUBLE, LogicalType::DOUBLE);
+        return make_unique<ORCType>(orc::TypeKind::DOUBLE, LogicalType::DOUBLE);
     case orc::TypeKind::STRING:
-        return ORCType(orc::TypeKind::STRING, LogicalType::VARCHAR);
+        return make_unique<ORCType>(orc::TypeKind::STRING, LogicalType::VARCHAR);
     case orc::TypeKind::BINARY:
-        return ORCType(orc::TypeKind::BINARY, LogicalType::BLOB);
+        return make_unique<ORCType>(orc::TypeKind::BINARY, LogicalType::BLOB);
     case orc::TypeKind::TIMESTAMP:
-        return ORCType(orc::TypeKind::TIMESTAMP, LogicalType::TIMESTAMP);
+        return make_unique<ORCType>(orc::TypeKind::TIMESTAMP, LogicalType::TIMESTAMP);
     case orc::TypeKind::LIST: {
         auto element_type = TransformSchema(type->getSubtype(0));
-        child_list_t<ORCType> children;
-        children.push_back(std::make_pair("element", element_type));
-        return ORCType(orc::TypeKind::LIST, LogicalType::LIST(element_type.duckdb_type), children);
+        auto list_type = make_unique<ORCType>(orc::TypeKind::LIST, 
+                                            LogicalType::LIST(element_type->duckdb_type));
+        list_type->AddChild("element", std::move(element_type));
+        return list_type;
     }
     case orc::TypeKind::MAP: {
         auto key_type = TransformSchema(type->getSubtype(0));
         auto value_type = TransformSchema(type->getSubtype(1));
-        child_list_t<ORCType> children;
-        children.push_back(std::make_pair("key", key_type));
-        children.push_back(std::make_pair("value", value_type));
-        return ORCType(orc::TypeKind::MAP, 
-                      LogicalType::MAP(key_type.duckdb_type, value_type.duckdb_type),
-                      children);
+        auto map_type = make_unique<ORCType>(orc::TypeKind::MAP,
+                                           LogicalType::MAP(key_type->duckdb_type, 
+                                                          value_type->duckdb_type));
+        map_type->AddChild("key", std::move(key_type));
+        map_type->AddChild("value", std::move(value_type));
+        return map_type;
     }
     case orc::TypeKind::STRUCT: {
-        child_list_t<ORCType> children;
+        child_list_t<LogicalType> struct_children;
+        auto struct_type = make_unique<ORCType>(orc::TypeKind::STRUCT, LogicalType::INVALID);
+        
         for (size_t i = 0; i < type->getSubtypeCount(); i++) {
             auto field_name = type->getFieldName(i);
             auto field_type = TransformSchema(type->getSubtype(i));
-            children.push_back(std::make_pair(field_name, field_type));
+            struct_children.push_back(make_pair(field_name, field_type->duckdb_type));
+            struct_type->AddChild(field_name, std::move(field_type));
         }
-        return ORCType(orc::TypeKind::STRUCT, LogicalType::STRUCT(children), children);
+        struct_type->duckdb_type = LogicalType::STRUCT(struct_children);
+        return struct_type;
     }
     default:
-        throw NotImplementedException("Unsupported ORC type: %s", 
-                                    TypeKind_Name(type->getKind()));
+        throw NotImplementedException("Unsupported ORC type: %s",
+                                    GetORCTypeName(type->getKind()).c_str());
     }
 }
 
@@ -227,7 +217,7 @@ static void TransformValue(const orc::ColumnVectorBatch* batch,
     case LogicalTypeId::STRUCT: {
         auto* struct_batch = dynamic_cast<const orc::StructVectorBatch*>(batch);
         for (idx_t i = 0; i < orc_type.children.size(); i++) {
-            TransformValue(struct_batch->fields[i], orc_type.children[i].second,
+            TransformValue(struct_batch->fields[i], *orc_type.children[i].second,
                          *StructVector::GetEntries(target)[i], row_idx);
         }
         break;
@@ -239,7 +229,7 @@ static void TransformValue(const orc::ColumnVectorBatch* batch,
         auto length = list_batch->offsets[row_idx + 1] - offsets;
         
         for (idx_t i = 0; i < length; i++) {
-            TransformValue(list_batch->elements.get(), orc_type.children[0].second,
+            TransformValue(list_batch->elements.get(), *orc_type.children[0].second,
                          entry_vector, offsets + i);
         }
         
@@ -256,9 +246,9 @@ static void TransformValue(const orc::ColumnVectorBatch* batch,
         auto length = map_batch->offsets[row_idx + 1] - offsets;
 
         for (idx_t i = 0; i < length; i++) {
-            TransformValue(map_batch->keys.get(), orc_type.children[0].second,
+            TransformValue(map_batch->keys.get(), *orc_type.children[0].second,
                          key_vector, offsets + i);
-            TransformValue(map_batch->elements.get(), orc_type.children[1].second,
+            TransformValue(map_batch->elements.get(), *orc_type.children[1].second,
                          value_vector, offsets + i);
         }
 
@@ -312,44 +302,50 @@ struct ORCReader {
     }
 
     ORCReader(ClientContext &context, const string& filename_p,
-              const ORCOptions& options_p) {
-        auto &fs = FileSystem::GetFileSystem(context);
-        if (!fs.FileExists(filename_p)) {
-            throw InvalidInputException("ORC file %s not found", filename_p);
-        }
+          const ORCOptions& options_p) {
+    	filename = filename_p;
+    	options = options_p;
 
-        auto file = fs.OpenFile(filename_p, FileFlags::FILE_FLAGS_READ);
-        auto file_size = file->GetFileSize();
-        vector<char> buffer(file_size);
-        auto bytes_read = file->Read(buffer.data(), file_size);
+    	auto &fs = FileSystem::GetFileSystem(context);
+    	if (!fs.FileExists(filename)) {
+    	    throw InvalidInputException("ORC file %s not found", filename);
+    	}
 
-        if (bytes_read != file_size) {
-            throw IOException("Failed to read entire file");
-        }
+	    auto file = fs.OpenFile(filename_p, FileFlags::FILE_FLAGS_READ);
+	    auto file_size = file->GetFileSize();
+	    allocated_data = Allocator::Get(context).Allocate(file_size);
+	    auto bytes_read = file->Read(allocated_data.get(), file_size);
 
-        auto input = std::make_unique<ORCMemoryInputStream>(buffer.data(), file_size);
-        reader = orc::createReader(std::move(input), orc::ReaderOptions());
+	    if (bytes_read != file_size) {
+	        throw IOException("Failed to read entire file");
+	    }
 
-        orc::RowReaderOptions row_opts;
-        row_reader = reader->createRowReader(row_opts);
-        batch = row_reader->createRowBatch(STANDARD_VECTOR_SIZE);
+	    auto input_stream = unique_ptr<ORCMemoryInputStream>(
+	        new ORCMemoryInputStream(const_char_ptr_cast(allocated_data.get()), file_size));
+	    reader = unique_ptr<orc::Reader>(
+	        orc::createReader(std::move(input_stream), orc::ReaderOptions()));
+    
+	    row_reader = unique_ptr<orc::RowReader>(
+	        reader->createRowReader(orc::RowReaderOptions()));
+	    batch = row_reader->createRowBatch(STANDARD_VECTOR_SIZE);
 
-        auto schema = reader->getType();
-        orc_type = TransformSchema(schema.get());
-        duckdb_type = orc_type.duckdb_type;
-        read_vec = make_uniq<Vector>(duckdb_type);
-        current_row = batch->numElements; // Force first read
+	    auto schema = reader->getType();
+	    auto orc_schema = TransformSchema(schema.get());
+	    duckdb_type = orc_schema->duckdb_type;
+	    orc_type = std::move(*orc_schema);
+	    read_vec = make_uniq<Vector>(duckdb_type);
+	    current_row = batch->numElements; // Force first read
 
-        if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-            for (idx_t child_idx = 0; child_idx < StructType::GetChildCount(duckdb_type); child_idx++) {
-                names.push_back(StructType::GetChildName(duckdb_type, child_idx));
-                return_types.push_back(StructType::GetChildType(duckdb_type, child_idx));
-            }
-        } else {
-            names.push_back("orc_data");
-            return_types.push_back(duckdb_type);
-        }
-    }
+	    if (duckdb_type.id() == LogicalTypeId::STRUCT) {
+	        for (idx_t child_idx = 0; child_idx < StructType::GetChildCount(duckdb_type); child_idx++) {
+	            names.push_back(StructType::GetChildName(duckdb_type, child_idx));
+	            return_types.push_back(StructType::GetChildType(duckdb_type, child_idx));
+	        }
+	    } else {
+	        names.push_back("orc_data");
+	        return_types.push_back(duckdb_type);
+	    }
+	}
 
     const string &GetFileName() { return filename; }
     const vector<string> &GetNames() { return names; }
