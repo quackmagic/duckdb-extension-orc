@@ -14,22 +14,77 @@
 
 namespace duckdb {
 
+template<typename T>
+using enable_if_t = typename std::enable_if<T::value>::type;
+
+template<typename T>
+constexpr bool is_floating_point_v = std::is_floating_point<T>::value;
+
 struct ORCType {
     ORCType() : duckdb_type(LogicalType::INVALID) {}
     
     ORCType(orc::TypeKind orc_type_p, LogicalType duckdb_type_p,
-            child_list_t<ORCType> children_p = {})
-        : duckdb_type(duckdb_type_p), orc_type(orc_type_p),
-          children(children_p) {}
+            child_list_t<LogicalType> children_p = {})
+        : duckdb_type(std::move(duckdb_type_p)), 
+          orc_type(orc_type_p) {
+        // Convert child types
+        for (const auto& child : children_p) {
+            children.emplace_back(child.first, child.second);
+        }
+    }
 
     LogicalType duckdb_type;
     orc::TypeKind orc_type;
-    child_list_t<ORCType> children;
+    child_list_t<LogicalType> children;
 
     bool operator==(const ORCType &other) const {
-        return duckdb_type == other.duckdb_type && orc_type == other.orc_type &&
+        return duckdb_type == other.duckdb_type && 
+               orc_type == other.orc_type &&
                children == other.children;
     }
+};
+
+// Fix for TypeKind_Name undefined error
+static string GetORCTypeName(orc::TypeKind type) {
+    switch(type) {
+        case orc::TypeKind::BOOLEAN: return "BOOLEAN";
+        case orc::TypeKind::BYTE: return "BYTE";
+        case orc::TypeKind::SHORT: return "SHORT";
+        case orc::TypeKind::INT: return "INT";
+        case orc::TypeKind::LONG: return "LONG";
+        case orc::TypeKind::FLOAT: return "FLOAT";
+        case orc::TypeKind::DOUBLE: return "DOUBLE";
+        case orc::TypeKind::STRING: return "STRING";
+        case orc::TypeKind::BINARY: return "BINARY";
+        case orc::TypeKind::TIMESTAMP: return "TIMESTAMP";
+        case orc::TypeKind::LIST: return "LIST";
+        case orc::TypeKind::MAP: return "MAP";
+        case orc::TypeKind::STRUCT: return "STRUCT";
+        default: return "UNKNOWN";
+    }
+}
+
+class ORCMemoryInputStream : public orc::InputStream {
+public:
+    ORCMemoryInputStream(const char* data, uint64_t length) 
+        : data_(data), length_(length), position_(0) {}
+
+    uint64_t getLength() const override { return length_; }
+    uint64_t getNaturalReadSize() const override { return 128 * 1024; }
+
+    void read(void* buf, uint64_t length, uint64_t offset) override {
+        if (offset + length > length_) {
+            throw std::runtime_error("Read past end of stream");
+        }
+        memcpy(buf, data_ + offset, length);
+    }
+
+    const char* getData() const { return data_; }
+
+private:
+    const char* data_;
+    uint64_t length_;
+    uint64_t position_;
 };
 
 struct ORCOptions {
@@ -256,27 +311,25 @@ struct ORCReader {
         output.SetCardinality(output_idx);
     }
 
-ORCReader(ClientContext &context, const string filename_p,
-              const ORCOptions &options_p) {
-        filename = filename_p;
-        options = options_p;
-
+    ORCReader(ClientContext &context, const string& filename_p,
+              const ORCOptions& options_p) {
         auto &fs = FileSystem::GetFileSystem(context);
-        if (!fs.FileExists(filename)) {
-            throw InvalidInputException("ORC file %s not found", filename);
+        if (!fs.FileExists(filename_p)) {
+            throw InvalidInputException("ORC file %s not found", filename_p);
         }
 
-        auto file = fs.OpenFile(filename, FileOpenFlags::FILE_FLAGS_READ);
-        allocated_data = Allocator::Get(context).Allocate(file->GetFileSize());
-        auto n_read = file->Read(allocated_data.get(), allocated_data.GetSize());
-        D_ASSERT(n_read == file->GetFileSize());
+        auto file = fs.OpenFile(filename_p, FileFlags::FILE_FLAGS_READ);
+        auto file_size = file->GetFileSize();
+        vector<char> buffer(file_size);
+        auto bytes_read = file->Read(buffer.data(), file_size);
 
-        std::unique_ptr<orc::InputStream> input(
-            new orc::MemoryInputStream(allocated_data.get(), allocated_data.GetSize()));
+        if (bytes_read != file_size) {
+            throw IOException("Failed to read entire file");
+        }
 
-        orc::ReaderOptions reader_opts;
-        reader = orc::createReader(std::move(input), reader_opts);
-        
+        auto input = std::make_unique<ORCMemoryInputStream>(buffer.data(), file_size);
+        reader = orc::createReader(std::move(input), orc::ReaderOptions());
+
         orc::RowReaderOptions row_opts;
         row_reader = reader->createRowReader(row_opts);
         batch = row_reader->createRowBatch(STANDARD_VECTOR_SIZE);
@@ -300,7 +353,7 @@ ORCReader(ClientContext &context, const string filename_p,
 
     const string &GetFileName() { return filename; }
     const vector<string> &GetNames() { return names; }
-const vector<LogicalType> &GetTypes() { return return_types; }
+    const vector<LogicalType> &GetTypes() { return return_types; }
 
     unique_ptr<orc::Reader> reader;
     unique_ptr<orc::RowReader> row_reader;
