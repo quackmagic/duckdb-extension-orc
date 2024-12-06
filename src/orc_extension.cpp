@@ -51,24 +51,30 @@ static string GetORCTypeName(orc::TypeKind type) {
 class ORCMemoryInputStream : public orc::InputStream {
 public:
     ORCMemoryInputStream(const char* data, uint64_t length) 
-        : data_(data), length_(length), position_(0) {}
+        : data_(data), length_(length) {}
 
-    uint64_t getLength() const override { return length_; }
-    uint64_t getNaturalReadSize() const override { return 128 * 1024; }
+    uint64_t getLength() const override { 
+        return length_; 
+    }
+
+    uint64_t getNaturalReadSize() const override { 
+        return 128 * 1024; 
+    }
 
     void read(void* buf, uint64_t length, uint64_t offset) override {
         if (offset + length > length_) {
-            throw std::runtime_error("Read past end of stream");
+            throw IOException("Read past end of stream");
         }
         memcpy(buf, data_ + offset, length);
     }
 
-    const char* getData() const { return data_; }
+    const char* getData() const { 
+        return data_; 
+    }
 
 private:
     const char* data_;
     uint64_t length_;
-    uint64_t position_;
 };
 
 struct ORCOptions {
@@ -301,50 +307,56 @@ struct ORCReader {
     }
 
     ORCReader(ClientContext &context, const string& filename_p,
-          const ORCOptions& options_p) {
-    	filename = filename_p;
-    	options = options_p;
+                    const ORCOptions& options_p) {
+    filename = filename_p;
+    options = options_p;
 
-    	auto &fs = FileSystem::GetFileSystem(context);
-    	if (!fs.FileExists(filename)) {
-    	    throw InvalidInputException("ORC file %s not found", filename);
-    	}
+    auto &fs = FileSystem::GetFileSystem(context);
+    if (!fs.FileExists(filename)) {
+        throw InvalidInputException("ORC file %s not found", filename);
+    }
 
-	    auto file = fs.OpenFile(filename_p, FileFlags::FILE_FLAGS_READ);
-	    auto file_size = file->GetFileSize();
-	    allocated_data = Allocator::Get(context).Allocate(file_size);
-	    auto bytes_read = file->Read(allocated_data.get(), file_size);
+    auto file = fs.OpenFile(filename_p, FileFlags::FILE_FLAGS_READ);
+    auto file_size = file->GetFileSize();
+    allocated_data = Allocator::Get(context).Allocate(file_size);
+    auto bytes_read = file->Read(allocated_data.get(), file_size);
 
-	    if (bytes_read != file_size) {
-	        throw IOException("Failed to read entire file");
-	    }
+    if (bytes_read != file_size) {
+        throw IOException("Failed to read entire file");
+    }
 
-	    auto input_stream = unique_ptr<ORCMemoryInputStream>(
-	        new ORCMemoryInputStream(const_char_ptr_cast(allocated_data.get()), file_size));
-	    reader = unique_ptr<orc::Reader>(
-	        orc::createReader(std::move(input_stream), orc::ReaderOptions()));
+    // Create input stream
+    ORCMemoryInputStream* input = new ORCMemoryInputStream(
+        const_char_ptr_cast(allocated_data.get()), file_size);
     
-	    row_reader = unique_ptr<orc::RowReader>(
-	        reader->createRowReader(orc::RowReaderOptions()));
-	    batch = row_reader->createRowBatch(STANDARD_VECTOR_SIZE);
+    // Create reader
+    reader.reset(orc::createReader(std::unique_ptr<orc::InputStream>(input), 
+                                 orc::ReaderOptions()));
+    
+    // Create row reader
+    orc::RowReaderOptions row_opts;
+    row_reader.reset(reader->createRowReader(row_opts));
+    
+    // Create batch
+    batch = row_reader->createRowBatch(STANDARD_VECTOR_SIZE);
 
-	    auto schema = reader->getType();
-	    auto orc_schema = TransformSchema(schema.get());
-	    duckdb_type = orc_schema->duckdb_type;
-	    orc_type = std::move(*orc_schema);
-	    read_vec = make_uniq<Vector>(duckdb_type);
-	    current_row = batch->numElements; // Force first read
+    auto schema = reader->getType();
+    auto orc_schema = TransformSchema(schema.get());
+    duckdb_type = orc_schema->duckdb_type;
+    orc_type = std::move(*orc_schema);
+    read_vec = make_uniq<Vector>(duckdb_type);
+    current_row = batch->numElements;
 
-	    if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-	        for (idx_t child_idx = 0; child_idx < StructType::GetChildCount(duckdb_type); child_idx++) {
-	            names.push_back(StructType::GetChildName(duckdb_type, child_idx));
-	            return_types.push_back(StructType::GetChildType(duckdb_type, child_idx));
-	        }
-	    } else {
-	        names.push_back("orc_data");
-	        return_types.push_back(duckdb_type);
-	    }
-	}
+    if (duckdb_type.id() == LogicalTypeId::STRUCT) {
+        for (idx_t child_idx = 0; child_idx < StructType::GetChildCount(duckdb_type); child_idx++) {
+            names.push_back(StructType::GetChildName(duckdb_type, child_idx));
+            return_types.push_back(StructType::GetChildType(duckdb_type, child_idx));
+        }
+    } else {
+        names.push_back("orc_data");
+        return_types.push_back(duckdb_type);
+    }
+    }
 
     const string &GetFileName() { return filename; }
     const vector<string> &GetNames() { return names; }
@@ -409,10 +421,15 @@ static bool ORCNextFile(ClientContext &context, const ORCBindData &bind_data,
         global_state.reader = make_shared<ORCReader>(context, file, bind_data.orc_options);
     }
 
-    bind_data.multi_file_reader->InitializeReader(
-        *global_state.reader, bind_data.orc_options.file_options,
-        bind_data.reader_bind, bind_data.types, bind_data.names,
-        global_state.column_ids, global_state.filters, file, context, nullptr);
+    bind_data.multi_file_reader->Initialize(*global_state.reader, 
+                                          bind_data.orc_options.file_options,
+                                          bind_data.reader_bind, 
+                                          bind_data.types, 
+                                          bind_data.names,
+                                          global_state.column_ids, 
+                                          global_state.filters, 
+                                          file, 
+                                          context);
     return true;
 }
 
